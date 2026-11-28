@@ -5,7 +5,7 @@
   1. 抓取 VPN Gate 原始节点（官方 API，失败回退 GitHub 镜像）
   2. 只保留带 TCP 入口的 SSTP 节点（VPN Gate 的 TCP 端口即 SSTP 端口）
   3. 去重 → 按 Ping 预排序 →（可选）截断
-  4. 并发调用检测 Worker
+  4. 并发调用检测 Worker（全部异常时降级为未实测发布，见 synthesize_unverified_results）
   5. 合并静态优选域名与优选 API 端点
   6. 生成 public/data.json + public/index.html + public/nodes.txt
 
@@ -405,6 +405,7 @@ def parse_csv(text: str) -> list[dict[str, Any]]:
     idx_short = pick("countryshort", default=6)
     idx_ping = pick("ping")
     idx_score = pick("score")
+    idx_operator = pick("operator")
     idx_config = pick("openvpn_configdata_base64")
     if idx_config is None:
         idx_config = next(
@@ -446,6 +447,7 @@ def parse_csv(text: str) -> list[dict[str, Any]]:
                 "config_b64": cell(idx_config),
                 "ping": to_int(idx_ping),
                 "score": to_int(idx_score),
+                "operator": cell(idx_operator),
             }
         )
     return rows
@@ -490,6 +492,7 @@ def parse_mirror_json(data: Any) -> list[dict[str, Any]]:
                 ).strip(),
                 "ping": as_int("ping"),
                 "score": as_int("score"),
+                "operator": str(server.get("operator") or "").strip(),
             }
         )
     return rows
@@ -507,6 +510,7 @@ class Node:
     country_code: str
     ping: int | None = None
     score: int | None = None
+    operator: str = ''
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -555,6 +559,7 @@ def to_sstp_nodes(rows: Iterable[dict[str, Any]]) -> list[Node]:
                 country_code=(row.get("country_short") or "").strip().upper(),
                 ping=row.get("ping"),
                 score=row.get("score"),
+                operator=(row.get("operator") or "").strip(),
             )
         )
     return nodes
@@ -715,6 +720,37 @@ def check_all(
         results.append(stub)
         timed_out += 1
     return results, timed_out
+
+
+def synthesize_unverified_results(nodes: list[Node]) -> list[dict[str, Any]]:
+    """检测 Worker 不可用时的降级发布：不实测，直接用 VPNGate 官方数据。
+
+    每个节点标记 success=True、unverified=True，延迟取 VPNGate 官方 Ping，
+    住宅/机房按 Operator 关键字粗分（分不出的记为未知）。节点未经实测
+    连通性验证，使用前请在 Windows SSTP 里实测。
+    """
+    results: list[dict[str, Any]] = []
+    for node in nodes:
+        result = node.to_dict()
+        result.update(
+            {
+                "protocol": "sstp",
+                "link": f"sstp://vpn:vpn@{node.host}:{node.port}",
+                "status": "success",
+                "success": True,
+                "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                "exit": None,
+                "latency_ms": node.ping,
+                "colo": None,
+                "error": None,
+                "worker_error": False,
+                "residential": classify_network(node.operator, None),
+                "unverified": True,
+                "verify_note": "未实测：检测 Worker 不可用，按 VPNGate 官方 Ping/速度排序",
+            }
+        )
+        results.append(result)
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -964,11 +1000,15 @@ def main() -> None:
 
     log("CLOUDFLARE WORKER", f"成功 {len(success)}, 失败 {len(failed)}（Worker 异常 {len(worker_errors)}）, 用时 {elapsed:.1f}s")
 
-    if unique_nodes and not success and len(worker_errors) == len(unique_nodes):
-        die("CLOUDFLARE WORKER", "检测 Worker 全部请求异常，本次不发布（保留上一次产物）")
-
+    fallback_unverified = False
     if unique_nodes and not success:
-        die("RESULT", "所有节点检测失败，本次不发布（保留上一次产物）")
+        if len(worker_errors) == len(unique_nodes):
+            log("CLOUDFLARE WORKER", "检测 Worker 全部请求异常，改用未实测模式发布（按 VPNGate 官方 Ping/速度排序，节点未经实测）")
+        else:
+            log("RESULT", "所有节点检测失败，改用未实测模式发布（按 VPNGate 官方 Ping/速度排序，节点未经实测）")
+        results = synthesize_unverified_results(unique_nodes)
+        success = [r for r in results if r.get("success")]
+        fallback_unverified = True
 
     ratio = len(success) / len(unique_nodes) if unique_nodes else 0.0
     if cfg.min_success_ratio > 0 and ratio < cfg.min_success_ratio:
@@ -988,6 +1028,9 @@ def main() -> None:
         duration_s=time.time() - started,
         timed_out=timed_out,
     )
+    if fallback_unverified:
+        data["fallback_unverified"] = True
+        data["fallback_note"] = "检测 Worker 不可用：本次按 VPNGate 官方数据发布，未实测连通性"
 
     edge_hosts = get_combined_edge_hosts(cfg, session)
     data_path, html_path, nodes_path, nodes_text = write_outputs(data, cfg, edge_hosts)
